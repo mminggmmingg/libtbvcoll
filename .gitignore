@@ -1,0 +1,15 @@
+# libtbvcoll 저장소: 이 실험 디렉터리에서 필요한 소스만 화이트리스트로 추적한다.
+# (tbv/ 는 별도 git 저장소, ksrc/·rccl-src/·rdma-core-build/ 등은 대용량 외부 소스)
+/*
+!/.gitignore
+!/README.md
+!/step3b/
+!/step4/
+!/reports/
+*.so
+*.bak
+*.o
+.rail_bw*
+__pycache__/
+.ar2
+.armr
