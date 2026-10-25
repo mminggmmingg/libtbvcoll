@@ -53,7 +53,9 @@
 #define NSLOT (G.nslot)
 #define SPIN_US 30                // 조건변수 전 짧은 스핀. 이 안에 끝나면 깨우기 비용 0.
 #define RAIL1_MAX (G.rail1max)    // 이하는 1레일이 빠르다(실측 교차점). TBV_RAIL1MAX 로 조정
-#define WDOG_SEC 10.0             // 워치독: 이 시간 넘으면 오류로 간주하고 GPU 를 풀어준다
+// 워치독: 이 시간 넘으면 오류로 간주하고 GPU 를 풀어준다. TBV_WDOG(초)로 바꾼다(기본 10).
+// 큰 모델의 첫 요청은 JIT 컴파일로 오래 걸린다(GLM-5.3 TCP 첫 요청 89.6s) — 그때 오탐하면 늘린다.
+static double WDOG_SEC = 10.0;
 
 static double nowt(){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec/1e9; }
 static ssize_t rdall(int fd,void*p,size_t n){char*c=(char*)p;size_t g=0;while(g<n){ssize_t r=read(fd,c+g,n-g);if(r<=0)return r;g+=r;}return g;}
@@ -92,6 +94,8 @@ static struct {
   volatile unsigned long long* cflag=nullptr;   // 슬롯별, 복사완료 통지(GPU → 진행 스레드)
   unsigned int* arrive=nullptr;                 // 슬롯별 블록 도착 카운터(디바이스)
   int gpusig=1;
+  int kwait=0;                                  // 1: GPU 대기를 CP 대기패킷 대신 스핀 커널로(진단용)
+  unsigned long long* bc=nullptr;               // GPU 발자국(호스트 가시): [대기진입, 대기통과, 복사시작, 가산완료] seq
   size_t rail1max=96u*1024u;
   int cpu=-1;
   int wr_hwm=8;
@@ -117,9 +121,13 @@ static struct {
 // 마지막 블록이 플래그를 쓴다 → 플래그가 보이면 모든 복사가 메모리까지 내려가 있다(NHI DMA 가 읽음).
 // 별도 k_sig 커널로 하면 앞선 복사의 L2 더티라인이 플러시되지 않아 DMA 가 오래된 데이터를 읽는다
 // (2026-10-21 실측 verify=BAD). 반드시 같은 커널이어야 한다.
+__device__ inline void bc_put(unsigned long long* bc, int i, unsigned long long v){
+  if(bc) __hip_atomic_store(bc+i, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM); }
 __global__ void k_copy_sig(char* __restrict__ dst, const char* __restrict__ src, size_t n,
                            volatile unsigned long long* flag, unsigned long long seq,
-                           unsigned int* arrive, unsigned int nblk, unsigned long long* tagp){
+                           unsigned int* arrive, unsigned int nblk, unsigned long long* tagp,
+                           unsigned long long* bc){
+  if(blockIdx.x==0 && threadIdx.x==0) bc_put(bc,2,seq);
   size_t i=(blockIdx.x*(size_t)blockDim.x+threadIdx.x)*16, st=(size_t)gridDim.x*blockDim.x*16;
   for(;i+16<=n;i+=st) *(float4*)(dst+i)=*(const float4*)(src+i);
   if(blockIdx.x==0 && threadIdx.x==0){ size_t t=n&~(size_t)15; for(size_t j=t;j<n;j++) dst[j]=src[j];
@@ -141,6 +149,16 @@ __global__ void k_tagchk(const unsigned long long* tag, unsigned long long seq, 
   if((v1!=seq||v2!=seq) && dbg[3]==0){ dbg[3]=seq; dbg[4]=v1; dbg[5]=v2; }
 }
 
+// TBV_KWAIT=1(진단용): hipStreamWaitValue64(CP 가 호스트 메모리를 폴링) 대신 웨이브 1개가 플래그를 스핀하고
+// GPU 발자국(bc)을 남긴다. 처음엔 GFXOFF 로 대기 패킷이 안 깨어난다는 가설로 넣었으나 기각됐고(KWAIT 에서도 정지),
+// 이 발자국으로 진짜 원인(rails_done 경합, 아래 tbv_ar_allreduce 주석)을 찾았다. >= 비교.
+__global__ void k_waitflag(const unsigned long long* flag, unsigned long long seq, unsigned long long* bc){
+  bc_put(bc,0,seq);
+  while(__hip_atomic_load(flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq)
+    __builtin_amdgcn_s_sleep(2);
+  bc_put(bc,1,seq);
+}
+__global__ void k_mark(unsigned long long* bc, int i, unsigned long long seq){ bc_put(bc,i,seq); }
 template<typename T> __global__ void k_acc(T* __restrict__ out, const T* __restrict__ a,
                                            const T* __restrict__ b, size_t n){
   size_t i=blockIdx.x*(size_t)blockDim.x+threadIdx.x, s=(size_t)gridDim.x*blockDim.x;
@@ -234,14 +252,23 @@ static void* progress_rail(void* arg){
       double tw=nowt();
       while(__atomic_load_n((unsigned long long*)((char*)G.cflag + 64*(size_t)it.slot),
                             __ATOMIC_ACQUIRE) < it.seq){
-        if(nowt()-tw>WDOG_SEC){ fprintf(stderr,"[tbvcoll] 워치독: rail%d 복사플래그 초과\n",x.idx);
+        if(nowt()-tw>WDOG_SEC){ fprintf(stderr,"[tbvcoll] 워치독: rail%d 복사플래그 %.0fs 초과 seq=%llu\n",x.idx,WDOG_SEC,
+                                        (unsigned long long)it.seq);
+                                if(G.bc) fprintf(stderr,"[tbvcoll]   GPU발자국 대기진입=%llu 대기통과=%llu 복사시작=%llu 가산완료=%llu 호스트seq=%llu cflag=%llu gflag[직전]=%llu\n",
+                                  G.bc[0],G.bc[1],G.bc[2],G.bc[3],(unsigned long long)G.seq,
+                                  *(volatile unsigned long long*)((char*)G.cflag+64*(size_t)it.slot),
+                                  *(volatile unsigned long long*)((char*)G.gflag+64*(size_t)((it.seq-1)%NSLOT)));
                                 G.err=1; break; } }
+      { double w=nowt()-tw;   // 1초 넘는 대기는 남긴다(JIT 지연인지 진짜 멈춤인지 구분용)
+        if(w>1.0 && x.idx==0) fprintf(stderr,"[tbvcoll] 복사플래그 대기 %.1fs seq=%llu\n",w,(unsigned long long)it.seq); }
     } else if(x.idx==0 && hipEventSynchronize(G.ev[it.slot])!=hipSuccess){ G.err=1; }
     if(!G.err && do_xfer_rail(x,it)!=0) G.err=1;
     // 마지막으로 끝난 레일이 GPU 를 해제한다. 오류여도 반드시 올린다(영구 스핀 방지).
-    if(__atomic_add_fetch(&G.rails_done[it.slot],1u,__ATOMIC_ACQ_REL) >= (unsigned)it.R)
+    // 다음 항목(seq+NSLOT)의 레일들은 GPU 가 이 gflag 를 통과해야 복사 플래그를 받으므로, 0 으로 되돌리는 것이 그보다 먼저다.
+    if(__atomic_add_fetch(&G.rails_done[it.slot],1u,__ATOMIC_ACQ_REL) >= (unsigned)it.R){
+      __atomic_store_n(&G.rails_done[it.slot],0u,__ATOMIC_RELAXED);
       __atomic_store_n((unsigned long long*)((char*)G.gflag + 64*(size_t)it.slot),
-                       it.seq, __ATOMIC_RELEASE);
+                       it.seq, __ATOMIC_RELEASE); }
     if(!G.err) reap_sends(x);
     __atomic_store_n(&x.q_tail, x.q_tail+1, __ATOMIC_RELEASE);
     pthread_mutex_lock(&G.mx); pthread_cond_broadcast(&G.cv_room); pthread_mutex_unlock(&G.mx);
@@ -256,6 +283,7 @@ extern "C" int tbv_ar_init(int rank, const char* devs, const char* peer_ip, int 
   // TBV_GPUSIG=1(기본): 복사 커널이 직접 완료 플래그를 올린다. 진행 스레드에 HIP 호출이 없어
   // vLLM 메인 스레드의 런치와 HIP 런타임 락에서 경합하지 않는다(배치 128 전송 673→756us 의 원인).
   { const char* e=getenv("TBV_GPUSIG"); G.gpusig = e? atoi(e):1; }
+  { const char* e=getenv("TBV_KWAIT"); G.kwait = e? atoi(e):0; }
   { const char* e=getenv("TBV_NSLOT"); int v = e? atoi(e):8;
     if(v<2) v=2; if(v>MAXSLOT) v=MAXSLOT; G.nslot=v; }
   // TBV_CHUNK: 레일 조각을 이 크기의 WR 여러 개로 쪼갠다. 드라이버가 post 시점에 4048B 프레임으로
@@ -264,6 +292,7 @@ extern "C" int tbv_ar_init(int rank, const char* devs, const char* peer_ip, int 
   { const char* e=getenv("TBV_CHUNK"); G.chunkb = e? (size_t)strtoull(e,0,10):0; }
   { const char* e=getenv("TBV_RAIL1MAX"); if(e) G.rail1max=(size_t)strtoull(e,0,10); }
   { const char* e=getenv("TBV_CPU"); G.cpu = e? atoi(e):-1; }
+  { const char* e=getenv("TBV_WDOG"); if(e && atof(e)>0) WDOG_SEC=atof(e); }
   { const char* e=getenv("TBV_TAG"); G.tag = (e && atoi(e) && G.async && G.gpusig)? 1:0; }
   G.stride = G.cap + (G.tag? 4096:0);
   // 슬롯 재사용 안전: 미수거 송신을 NSLOT-1 "항목" 분량 이하로 유지해야 한다.
@@ -297,6 +326,8 @@ extern "C" int tbv_ar_init(int rank, const char* devs, const char* peer_ip, int 
   if(hipHostMalloc((void**)&G.gflag, 64*NSLOT, hipHostMallocCoherent)!=hipSuccess) FAIL("hipHostMalloc flag");
   for(int i=0;i<NSLOT;i++) *(unsigned long long*)((char*)G.gflag+64*(size_t)i)=0;
   if(hipHostMalloc((void**)&G.cflag, 64*NSLOT, hipHostMallocCoherent)!=hipSuccess) FAIL("hipHostMalloc cflag");
+  if(hipHostMalloc((void**)&G.bc, 64, hipHostMallocCoherent)!=hipSuccess) FAIL("hipHostMalloc bc");
+  memset(G.bc,0,64);
   if(G.tag){ if(hipHostMalloc((void**)&G.dbg, 64, hipHostMallocCoherent)!=hipSuccess) FAIL("hipHostMalloc dbg");
              memset(G.dbg,0,64); }
   for(int i=0;i<NSLOT;i++) *(unsigned long long*)((char*)G.cflag+64*(size_t)i)=0;
@@ -376,7 +407,7 @@ extern "C" int tbv_ar_init(int rank, const char* devs, const char* peer_ip, int 
       if(pthread_create(&G.rr[r].th,nullptr,progress_rail,&G.rr[r])) FAIL("pthread_create"); } }
   G.inited=1;
   fprintf(stderr,"[tbvcoll] rank%d ready: %d rail, cap=%zu KiB, 슬롯 %d, 모드 %s\n",
-          rank,G.R,G.cap/1024,NSLOT,G.async?(G.gpusig?"ASYNC+GPUSIG":"ASYNC+EVENT"):"SYNC");
+          rank,G.R,G.cap/1024,NSLOT,G.async?(G.gpusig?(G.kwait?"ASYNC+GPUSIG+KWAIT":"ASYNC+GPUSIG"):"ASYNC+EVENT"):"SYNC");
   fprintf(stderr,"[tbvcoll]   청크 %zu KiB, 송신WR 상한 %d, 레일별 진행스레드 %d개\n",G.chunkb/1024,G.wr_hwm,G.async?G.R:0);
   if(G.uncached||G.tag) fprintf(stderr,"[tbvcoll]   진단: TBV_UNCACHED=%d TBV_TAG=%d\n",G.uncached,G.tag);
   return 0;
@@ -389,7 +420,13 @@ extern "C" int tbv_ar_allreduce(void* ptr, void* outp, size_t nbytes, int dtype,
   if(nbytes>G.cap) return -2;                       // 호출자가 NCCL 로 폴백
   if(!outp) outp=ptr;
   hipStream_t st=(hipStream_t)stream;
-  if(stream!=G.last_stream){ if(G.last_stream) G.n_stream_sw++; G.last_stream=stream; }
+  if(stream!=G.last_stream){ if(G.last_stream) G.n_stream_sw++; G.last_stream=stream;
+    // 처음 보는 스트림이면 남긴다(요청 경계 정지가 다른 스트림 호출과 관련 있는지 확인용)
+    static void* seen[16]; static int nseen=0; bool f=false;
+    for(int i=0;i<nseen;i++) if(seen[i]==stream){ f=true; break; }
+    if(!f && nseen<16){ seen[nseen++]=stream;
+      fprintf(stderr,"[tbvcoll] 새 스트림 #%d %p seq=%llu nbytes=%zu\n",nseen,stream,(unsigned long long)(G.seq+1),nbytes); }
+    else if(G.n_stream_sw<=20) fprintf(stderr,"[tbvcoll] 스트림 전환 %p seq=%llu\n",stream,(unsigned long long)(G.seq+1)); }
   size_t tagoff=(nbytes+7)&~(size_t)7, xbytes=G.tag? tagoff+8 : nbytes;
   int R = (nbytes<=RAIL1_MAX)?1:G.R;
   int th=256;
@@ -420,20 +457,26 @@ extern "C" int tbv_ar_allreduce(void* ptr, void* outp, size_t nbytes, int dtype,
       size_t v=(nbytes+15)/16; int bl=(int)std::min<size_t>(320,(v+th-1)/th); if(bl<1) bl=1;
       k_copy_sig<<<bl,th,0,st>>>(slot_send(slot),(const char*)ptr,nbytes,
                                  (volatile unsigned long long*)((char*)G.cflag + 64*(size_t)slot),myseq,&G.arrive[slot],(unsigned)bl,
-                                 G.tag? (unsigned long long*)(slot_send(slot)+tagoff) : nullptr);
+                                 G.tag? (unsigned long long*)(slot_send(slot)+tagoff) : nullptr, G.bc);
       if(hipGetLastError()!=hipSuccess) FAIL("k_copy_sig 런치");
     } else {
       if(hipMemcpyAsync(slot_send(slot),ptr,nbytes,hipMemcpyDeviceToDevice,st)!=hipSuccess) FAIL("D2D in");
       if(hipEventRecord(G.ev[slot],st)!=hipSuccess) FAIL("eventRecord");
     }
-    __atomic_store_n(&G.rails_done[slot],0u,__ATOMIC_RELEASE);
+    // rails_done[slot] 은 호스트가 지우지 않는다. 지우면 경합: 디코드(1레일) 뒤 prefill(2레일)처럼 레일별 큐 깊이가
+    // 다를 때, 호스트가 같은 슬롯의 다음 항목(seq+NSLOT)을 넣으며 0 으로 만들 때 rail1 이 아직 seq 를 끝내지 않았으면
+    // 카운트가 R 에 못 미쳐 gflag 가 영영 안 올라간다(2026-10-25 GLM-5.3 요청 경계 정지, GPU 발자국으로 확인:
+    // 두 레일 모두 seq 를 끝냈는데 gflag[슬롯]=seq-NSLOT). 마지막 레일이 스스로 0 으로 되돌린다.
     for(int r=0;r<R;r++){ Rail& x=G.rr[r];
       uint64_t h=__atomic_load_n(&x.q_head,__ATOMIC_RELAXED);
       x.q[h % NSLOT] = Item{myseq,slot,nbytes,R,xbytes};
       __atomic_store_n(&x.q_head,h+1,__ATOMIC_RELEASE); }
     pthread_mutex_lock(&G.mx); pthread_cond_broadcast(&G.cv_item); pthread_mutex_unlock(&G.mx);
     // GPU 가 진행 스레드의 플래그를 기다린다. 이 대기 중 GPU 사용률은 100% 로 보인다(스핀).
-    if(hipStreamWaitValue64(st,(void*)((char*)G.gflag + 64*(size_t)slot),(uint64_t)myseq,
+    if(G.kwait){
+      k_waitflag<<<1,1,0,st>>>((const unsigned long long*)((char*)G.gflag + 64*(size_t)slot),myseq,G.bc);
+      if(hipGetLastError()!=hipSuccess) FAIL("k_waitflag 런치");
+    } else if(hipStreamWaitValue64(st,(void*)((char*)G.gflag + 64*(size_t)slot),(uint64_t)myseq,
                             hipStreamWaitValueEq,0xffffffffffffffffull)!=hipSuccess) FAIL("streamWaitValue");
     if(G.tag) k_tagchk<<<1,1,0,st>>>((const unsigned long long*)(slot_recv(slot)+tagoff),myseq,G.dbg);
   } else {
@@ -458,6 +501,7 @@ extern "C" int tbv_ar_allreduce(void* ptr, void* outp, size_t nbytes, int dtype,
   else { size_t m=nbytes/2; int bl=(int)std::min<size_t>(160,(m+th-1)/th);
     k_acc<__hip_bfloat16><<<bl,th,0,st>>>((__hip_bfloat16*)outp,(const __hip_bfloat16*)ptr,(const __hip_bfloat16*)rb,m); }
   if(hipGetLastError()!=hipSuccess) FAIL("k_acc");
+  if(G.kwait && G.bc) k_mark<<<1,1,0,st>>>(G.bc,3,myseq);
   G.t_post+=nowt()-tq;
   G.t_enq+=nowt()-te;
   return 0;

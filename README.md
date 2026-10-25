@@ -11,6 +11,7 @@
 - `reports/` — 설계·측정 기록(10_tp_custom_allreduce.md 가 핵심).
 
 주요 환경변수: `TBV_ASYNC`(1), `TBV_NSLOT`(4 권장), `TBV_CAP`(=메시지 크기), `TBV_CPU`, `TBV_UNCACHED`(기본 1: 송신 바운스
-GPU 비캐시 — 일반 hipMalloc 은 NHI DMA 가 이전 내용을 읽어 출력이 오염된다), `TBV_TAG`(진단).
+GPU 비캐시 — 일반 hipMalloc 은 NHI DMA 가 이전 내용을 읽어 출력이 오염된다), `TBV_WDOG`(워치독 초, 기본 10),
+`TBV_TAG`·`TBV_KWAIT`(진단 — KWAIT 는 스핀 커널 대기 + 워치독에 GPU 발자국 출력).
 
 tbv 드라이버 쪽 수정(크레딧 교착 등)은 `thunderbolt-ibverbs` 저장소 `zbook-gpu-direct-fixes` 브랜치.
