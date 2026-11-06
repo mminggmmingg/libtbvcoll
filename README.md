@@ -15,3 +15,7 @@ GPU 비캐시 — 일반 hipMalloc 은 NHI DMA 가 이전 내용을 읽어 출�
 `TBV_TAG`·`TBV_KWAIT`(진단 — KWAIT 는 스핀 커널 대기 + 워치독에 GPU 발자국 출력).
 
 tbv 드라이버 쪽 수정(크레딧 교착 등)은 `thunderbolt-ibverbs` 저장소 `zbook-gpu-direct-fixes` 브랜치.
+
+## 라이선스
+
+GPL-3.0 — [LICENSE](LICENSE). Copyright (C) 2026 mminggmmingg. 고쳐서 배포할 때도 같은 GPL-3.0 으로 소스를 공개해야 한다.
